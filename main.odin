@@ -408,7 +408,7 @@ main :: proc() {
                     append(&curr_maps_names, map_fileinfo.name)
                 }
 
-                list_view_str, err := strings.join_safe(curr_maps_names[:], ";", allocator = context.temp_allocator)
+                list_view_str, err := strings.join(curr_maps_names[:], ";", allocator = context.temp_allocator)
                 assert(err == nil)
                 maps_list_view_cstr := strings.clone_to_cstring(list_view_str, allocator = context.temp_allocator)
 
