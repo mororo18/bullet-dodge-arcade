@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:math"
 import "core:os"
 import "core:time"
@@ -10,17 +11,18 @@ import "core:encoding/json"
 import fp "core:path/filepath"
 import rl "vendor:raylib"
 
-NORTH :: rl.Vector2 { 0, -1 }
-EAST  :: rl.Vector2 { 1, 0 }
-SOUTH :: rl.Vector2 { 0, 1 }
-WEST  :: rl.Vector2 { -1, 0 }
+Vec2 :: [2]f32
 
-PLAYER_RADIUS :: 20
-BULLET_RADIUS :: 8
+Error :: union #shared_nil {
+    MainError,
+    json.Error,
+    json.Unmarshal_Error,
+    os.Error,
+}
 
-CONTRUCTED_WALL_LENGHT :: 300
-
-alloc_data: AllocatorData
+MainError :: enum {
+    BadFile
+}
 
 BulletType :: enum {
     Bouncer,
@@ -29,23 +31,27 @@ BulletType :: enum {
 }
 
 Bullet :: struct {
-    position: rl.Vector2,
-    direction: rl.Vector2,
+    position: Vec2,
+    direction: Vec2,
     speed: f32,
     type: BulletType,
 }
 
 BulletSpawner :: struct {
-    position: rl.Vector2,
+    x: f32,
+    y: f32,
     spawn_frequency: f32,
-    timer: f32,
     velocity: f32,
-    bullet_type: BulletType,
+    timer: f32,
+    bullet_type: string,
+    bullet_type_enum: BulletType,
 }
 
 Wall :: struct {
-    start: rl.Vector2,
-    end: rl.Vector2,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
     invulnerable: bool,
 }
 
@@ -53,35 +59,85 @@ State :: struct {
     map_width: i32,
     map_height: i32,
 
-    player_position: rl.Vector2, 
+    player_position: Vec2, 
     player_speed: f32,
     walls: [dynamic]Wall,
+    bullet_spawners: [dynamic]BulletSpawner,
+
     bullets: [dynamic]Bullet,
-    spawners: [dynamic]BulletSpawner,
 
     wall_thickness: u32,
     game_over: bool,
     time_alive: f32,
 }
 
-vec_perpendicular :: proc(vec: rl.Vector2) -> rl.Vector2 {
-    return rl.Vector2 {vec.y, -vec.x}
+NORTH :: Vec2 {  0, -1 }
+EAST  :: Vec2 {  1,  0 }
+SOUTH :: Vec2 {  0,  1 }
+WEST  :: Vec2 { -1,  0 }
+
+PLAYER_RADIUS :: 20
+BULLET_RADIUS :: 8
+
+CONTRUCTED_WALL_LENGHT :: 300
+
+ARENA :: #config(ARENA, false)
+when ARENA {
+    AllocatorDataType :: mem.Arena
+} else {
+    AllocatorDataType :: AllocatorData
 }
-vec_perpendicular_to_wall :: proc(wall: ^Wall) -> rl.Vector2 {
-    wall_vec := wall.end - wall.start
+
+alloc_data: AllocatorDataType
+
+init_allocator :: proc(alloc_data: ^AllocatorDataType) {
+    total_bytes :: 8196
+    when ARENA {
+        data, err := mem.alloc_bytes(total_bytes)
+        assert(err == .None)
+        mem.arena_init(alloc_data, data)
+    } else {
+        init_allocator_data(alloc_data, total_bytes)
+    }
+}
+
+free_allocator :: proc(alloc_data: ^AllocatorDataType) {
+    when ARENA {
+        mem.free_bytes(alloc_data.data)
+    } else {
+        free_allocator_data(alloc_data)
+    }
+}
+
+get_allocator :: proc(alloc_data: ^AllocatorDataType) -> mem.Allocator {
+    when ARENA {
+        return mem.arena_allocator(alloc_data)
+    } else {
+        return my_allocator(alloc_data)
+    }
+}
+
+vec_perpendicular :: proc(vec: Vec2) -> Vec2 {
+    return Vec2 {vec.y, -vec.x}
+}
+
+vec_perpendicular_to_wall :: proc(wall: Wall) -> Vec2 {
+    wall_vec := Vec2{wall.x2, wall.y2} - Vec2{wall.x1, wall.y1}
     return rl.Vector2Normalize(vec_perpendicular(wall_vec))
 }
 
-check_wall_collision :: proc(wall: ^Wall, center: rl.Vector2, radius: f32, state: ^State) -> bool {
+check_wall_collision :: proc(wall: Wall, center: Vec2, radius: f32, state: State) -> bool {
     perpend := vec_perpendicular_to_wall(wall)
+    wall_start := Vec2{wall.x1, wall.y1}
+    wall_end := Vec2{wall.x2, wall.y2}
 
     half_thick := cast(f32) state.wall_thickness / 2
 
-    left_start  := wall.start + perpend * half_thick
-    left_end := wall.end + perpend * half_thick
+    left_start  := wall_start + perpend * half_thick
+    left_end := wall_end + perpend * half_thick
                                         
-    right_start := wall.start - perpend * half_thick
-    right_end := wall.end - perpend * half_thick
+    right_start := wall_start - perpend * half_thick
+    right_end := wall_end - perpend * half_thick
 
     return (rl.CheckCollisionCircleLine(center, radius, left_start, left_end)
         || rl.CheckCollisionCircleLine(center, radius, right_start, right_end)
@@ -89,28 +145,26 @@ check_wall_collision :: proc(wall: ^Wall, center: rl.Vector2, radius: f32, state
         || rl.CheckCollisionCircleLine(center, radius, right_end, left_end))
 }
 
-random_direction :: proc() -> rl.Vector2 {
+random_direction :: proc() -> Vec2 {
     return rl.Vector2Normalize(
-        rl.Vector2 { rand.float32_range(-1, 1), rand.float32_range(-1, 1) }
+        Vec2 { rand.float32_range(-1, 1), rand.float32_range(-1, 1) }
     )
 }
 
 update_state :: proc(state: ^State, dt: f32) {
-    context.allocator = my_allocator(&alloc_data)
+    player_movement_direction: Vec2
 
-    player_movement_direction: rl.Vector2
-
-    if (rl.IsKeyDown(.W)) { player_movement_direction += NORTH }
-    if (rl.IsKeyDown(.D)) { player_movement_direction += EAST }
-    if (rl.IsKeyDown(.S)) { player_movement_direction += SOUTH }
-    if (rl.IsKeyDown(.A)) { player_movement_direction += WEST }
+    if (rl.IsKeyDown(.W)) do player_movement_direction += NORTH
+    if (rl.IsKeyDown(.D)) do player_movement_direction += EAST
+    if (rl.IsKeyDown(.S)) do player_movement_direction += SOUTH
+    if (rl.IsKeyDown(.A)) do player_movement_direction += WEST
     
     player_new_position := (state.player_position
         + rl.Vector2Normalize(player_movement_direction) * state.player_speed * dt)
 
     all_good := true
     for &wall in state.walls {
-        if (check_wall_collision(&wall, player_new_position, PLAYER_RADIUS, state)) {
+        if (check_wall_collision(wall, player_new_position, PLAYER_RADIUS, state^)) {
             all_good = false
             break
         }
@@ -121,7 +175,7 @@ update_state :: proc(state: ^State, dt: f32) {
     }
 
     // Update spawners' timers
-    for &spawner in state.spawners {
+    for &spawner in state.bullet_spawners {
         spawner.timer += dt
 
         if spawner.timer > spawner.spawn_frequency {
@@ -129,8 +183,8 @@ update_state :: proc(state: ^State, dt: f32) {
 
             // Spawn bullet
             new_bullet := Bullet {
-                position = spawner.position,
-                type = spawner.bullet_type,
+                position = {spawner.x,  spawner.y},
+                type = spawner.bullet_type_enum,
                 direction = random_direction(),
                 speed = spawner.velocity,
             }
@@ -146,7 +200,7 @@ update_state :: proc(state: ^State, dt: f32) {
 
         bullet_will_collide_with_wall := false
         #reverse for &wall, wall_index in state.walls {
-            if (check_wall_collision(&wall, bullet_new_position, BULLET_RADIUS, state)) {
+            if (check_wall_collision(wall, bullet_new_position, BULLET_RADIUS, state^)) {
                 bullet_will_collide_with_wall = true
 
                 switch bullet.type {
@@ -155,7 +209,7 @@ update_state :: proc(state: ^State, dt: f32) {
                     unordered_remove(&state.bullets, bullet_index)
                 case .Constructor:
 
-                    new_wall_dir := rl.Vector2(vec_perpendicular(bullet.direction))
+                    new_wall_dir := Vec2(vec_perpendicular(bullet.direction))
                     new_wall_center := (bullet_new_position 
                         + BULLET_RADIUS * rl.Vector2Normalize(bullet.direction))
 
@@ -163,8 +217,10 @@ update_state :: proc(state: ^State, dt: f32) {
                     new_wall_end := new_wall_center - new_wall_dir * CONTRUCTED_WALL_LENGHT / 2
 
                     new_wall := Wall {
-                        start = new_wall_start,
-                        end = new_wall_end,
+                        x1 = new_wall_start.x,
+                        y1 = new_wall_start.y,
+                        x2 = new_wall_end.x,
+                        y2 = new_wall_end.y,
                     }
 
                     append(&state.walls, new_wall)
@@ -173,7 +229,7 @@ update_state :: proc(state: ^State, dt: f32) {
                 case .Bouncer:
                     bullet_dir := -bullet.direction
                     // TODO: This function only returns the perpendicular vec, but a wall actually has 4 sides.
-                    wall_perpend_vec := rl.Vector2Normalize(vec_perpendicular_to_wall(&wall))
+                    wall_perpend_vec := rl.Vector2Normalize(vec_perpendicular_to_wall(wall))
 
                     if rl.Vector2DotProduct(wall_perpend_vec, bullet_dir) < 0 {
                         wall_perpend_vec = -wall_perpend_vec
@@ -191,9 +247,7 @@ update_state :: proc(state: ^State, dt: f32) {
         }
 
         // Update bullet's position
-        if !bullet_will_collide_with_wall {
-            bullet.position = bullet_new_position
-        }
+        if !bullet_will_collide_with_wall do bullet.position = bullet_new_position
 
         // Check colision with player
         if rl.CheckCollisionCircles(bullet.position, BULLET_RADIUS, state.player_position, PLAYER_RADIUS) {
@@ -208,28 +262,24 @@ update_state :: proc(state: ^State, dt: f32) {
         }
     }
 
-    if !state.game_over {
-        state.time_alive += dt
-    }
+    if !state.game_over do state.time_alive += dt
 }
 
-draw_wall :: proc(wall: ^Wall, state: ^State) {
-    angle := rl.Vector2LineAngle(wall.start, wall.end)
-    dist := rl.Vector2Distance(wall.start, wall.end)
+draw_wall :: proc(wall: Wall, state: State) {
+    angle := rl.Vector2LineAngle({wall.x1, wall.y1}, {wall.x2, wall.y2})
+    dist := rl.Vector2Distance({wall.x1, wall.y1}, {wall.x2, wall.y2})
     rect := rl.Rectangle {
-        wall.start.x,
-        wall.start.y,
+        wall.x1,
+        wall.y1,
         dist,
         cast(f32)state.wall_thickness,
     }
 
-    origin := rl.Vector2 {0, (cast(f32)state.wall_thickness / 2)}
+    origin := Vec2 {0, (cast(f32)state.wall_thickness / 2)}
     rl.DrawRectanglePro(rect, origin , math.to_degrees(-angle), rl.BLUE)
 }
 
-draw :: proc(state: ^State) {
-    context.allocator = context.temp_allocator
-    defer free_all()
+draw :: proc(state: State) {
 
     rl.DrawCircle(cast(i32) state.player_position.x, cast(i32) state.player_position.y, PLAYER_RADIUS, rl.GREEN)
 
@@ -237,106 +287,29 @@ draw :: proc(state: ^State) {
         rl.DrawCircle(cast(i32) bullet.position.x, cast(i32) bullet.position.y, BULLET_RADIUS, rl.RED)
     }
 
-    for spawner in state.spawners {
-        rl.DrawRing(spawner.position, 8, 13, 0, 360, 20, rl.PINK)
+    for spawner in state.bullet_spawners {
+        rl.DrawRing({spawner.x, spawner.y}, 8, 13, 0, 360, 20, rl.PINK)
     }
 
-    for &wall in state.walls {
-        draw_wall(&wall, state)
-    }
+    for &wall in state.walls do draw_wall(wall, state)
 }
 
-alloc_and_init_state :: proc(json_obj: ^json.Object) -> ^State {
-    context.allocator = my_allocator(&alloc_data)
+read_json_as_struct :: proc(state: ^State, filename: string) -> (err: Error) {
+    data := os.read_entire_file_from_filename_or_err(filename, context.temp_allocator) or_return
+    json.unmarshal(data, state, allocator = get_allocator(&alloc_data)) or_return
 
-    state := new(State)
-    state^ = State {
-        player_position = {300, 300},
-        walls = make([dynamic]Wall, 0, len(json_obj["walls"].(json.Array)))
+    bullet_type := make(map[string]BulletType, context.temp_allocator)
+    bullet_type["bouncer"] = .Bouncer
+    bullet_type["bulldozer"] = .Bulldozer
+    bullet_type["constructor"] = .Constructor
+
+    for &spawner in state.bullet_spawners {
+        if !(spawner.bullet_type in bullet_type) do panic("Invalid bullet type")
+        spawner.bullet_type_enum = bullet_type[spawner.bullet_type]
     }
 
-    state.map_width = i32(json_obj["map_width"].(json.Float))
-    state.map_height = i32(json_obj["map_width"].(json.Float))
-    state.wall_thickness = u32(json_obj["wall_thickness"].(json.Float))
-    state.player_speed = f32(json_obj["player_speed"].(json.Float))
-
-    for wall_json in json_obj["walls"].(json.Array) {
-        new_wall := Wall {
-            start = {
-                f32(wall_json.(json.Object)["x1"].(json.Float)),
-                f32(wall_json.(json.Object)["y1"].(json.Float))
-            },
-            end = {
-                f32(wall_json.(json.Object)["x2"].(json.Float)),
-                f32(wall_json.(json.Object)["y2"].(json.Float))
-            },
-           invulnerable = false,
-        }
-
-
-        if wall_json.(json.Object)["invulnerable"] != nil {
-            new_wall.invulnerable = wall_json.(json.Object)["invulnerable"].(json.Boolean)
-        }
-
-        append(&state.walls, new_wall)
-
-    }
-
-    for bullet_spawner_json in json_obj["bullet_spawners"].(json.Array) {
-        new_spawner := BulletSpawner {
-            spawn_frequency = f32(bullet_spawner_json.(json.Object)["spawn_frequency"].(json.Float)),
-            velocity = f32(bullet_spawner_json.(json.Object)["velocity"].(json.Float)),
-            position =  {
-                f32(bullet_spawner_json.(json.Object)["x"].(json.Float)),
-                f32(bullet_spawner_json.(json.Object)["y"].(json.Float))
-            }
-        }
-
-        bullet_type_str := bullet_spawner_json.(json.Object)["bullet_type"].(json.String)
-        if bullet_type_str == "bouncer" {
-            new_spawner.bullet_type = .Bouncer
-        } else if bullet_type_str == "bulldozer" {
-            new_spawner.bullet_type = .Bulldozer
-        } else if bullet_type_str == "constructor" {
-            new_spawner.bullet_type = .Constructor
-        } else {
-            panic("Invalid bullet type")
-        }
-
-        append(&state.spawners, new_spawner)
-    }
-
-    return state
-}
-
-get_current_maps_filenames :: proc() -> []os.File_Info {
-    maps_dir_fd, open_err := os.open("maps/")
-    defer os.close(maps_dir_fd)
-    dir_items, read_err := os.read_dir(maps_dir_fd, -1, allocator = context.temp_allocator)
-
-    maps_files := make([dynamic]os.File_Info, allocator = context.temp_allocator)
-    for item in dir_items {
-        if os.is_file(item.fullpath) && fp.ext(item.name) == ".json" {
-            append(&maps_files, item)
-        }
-    }
-
-    return maps_files[:]
-}
-
-read_json_config :: proc(filename: string) -> json.Value {
-    data, ok := os.read_entire_file_from_filename(filename, allocator = context.temp_allocator)
-
-    if !ok {
-        panic("Data read incorrectly.")
-    }
-
-    json_data, err := json.parse(data, allocator = context.temp_allocator)
-    if err != .None {
-        panic("Json couldn't be parsed")
-    }
-
-    return json_data
+    state.player_position = {300, 300}
+    return
 }
 
 main :: proc() {
@@ -344,9 +317,8 @@ main :: proc() {
 
     rand.reset(time.read_cycle_counter())
 
-
-    init_allocator_data(&alloc_data, 8196)
-    defer free_allocator_data(&alloc_data)
+    init_allocator(&alloc_data)
+    defer free_allocator(&alloc_data)
 
     state: ^State
 
@@ -362,16 +334,17 @@ main :: proc() {
     list_view_visibility := false
 
     for !rl.WindowShouldClose() {
+        defer free_all(context.temp_allocator)
 
         if state != nil {
-            if !state.game_over {
-                update_state(state, rl.GetFrameTime())
-            }
+            if !state.game_over do update_state(state, rl.GetFrameTime())
 
             if state.map_width != window_width || state.map_height != window_height {
                 rl.SetWindowSize(state.map_width, state.map_height)
                 window_width = state.map_width
                 window_height = state.map_height
+
+                fmt.println("Reszied window", window_width, window_height)
             }
         }
 
@@ -379,7 +352,7 @@ main :: proc() {
         {
             rl.ClearBackground(rl.RAYWHITE)
             if state != nil {
-                draw(state)
+                draw(state^)
 
                 // OnScreenInfo
                 rl.DrawText(fmt.ctprintf("Num bullets: %d", len(state.bullets)), 20, 20, 20, rl.GRAY)
@@ -395,17 +368,17 @@ main :: proc() {
             }
 
             if list_view_visibility {
-                defer free_all(context.temp_allocator)
 
                 scroll_index: i32
                 active: i32 = -1
 
-                curr_maps := get_current_maps_filenames()
+                curr_maps := fp.glob("maps/*.json", context.temp_allocator) or_else []string{}
 
-                curr_maps_names := make([dynamic]string, allocator = context.temp_allocator)
+                curr_maps_names := make([dynamic]string, context.temp_allocator)
 
-                for map_fileinfo in curr_maps {
-                    append(&curr_maps_names, map_fileinfo.name)
+                for map_filepath in curr_maps {
+                    _, filename := fp.split(map_filepath)
+                    append(&curr_maps_names,  filename)
                 }
 
                 list_view_str, err := strings.join(curr_maps_names[:], ";", allocator = context.temp_allocator)
@@ -419,11 +392,13 @@ main :: proc() {
                     list_view_visibility = false
 
                     if state != nil {
-                        free_all(my_allocator(&alloc_data))
+                        free_all(get_allocator(&alloc_data))
                     }
 
-                    json_config := read_json_config(curr_maps[active].fullpath)
-                    state = alloc_and_init_state(&json_config.(json.Object))
+                    state = new(State, get_allocator(&alloc_data))
+                    err := read_json_as_struct(state, curr_maps[active])
+
+                    if err != nil do fmt.eprintln("got error: %v", err)
                 }
             }
 
